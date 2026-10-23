@@ -582,6 +582,10 @@ def annotate_unindexed_insertion(
         global_logger.warning("No unindexed region could be mapped; the unindexed conditioning is dropped.")
         return _set_empty_unindexed_annotations()
 
+    # Per-token coord staging, so an incompletely reproduced motif invalidates only its own
+    # reference coords: {unindexed_token_id: (expected_atom_count, staged_target_indices)}.
+    per_token_coord_staging: dict[int, tuple[int, np.ndarray]] = {}
+
     try:
         for unindexed_token_id, (target_token_id, token_correspondence) in applicable_mapping.items():
             unindexed_token_mask = in_context_conditioning.token_id == unindexed_token_id
@@ -638,6 +642,7 @@ def annotate_unindexed_insertion(
             )
             remapped_coord[coord_target] = token_ref_coord[token_coord_mask]
             reference_coord[coord_target] = unindexed_internal_coords[unindexed_token_mask][token_coord_mask]
+            per_token_coord_staging[unindexed_token_id] = (int(token_coord_mask.sum()), coord_target)
 
         # Insertion restores membership and frozen targets together, in the source groups' frames.
         internal_targets = C_INTCRD.annotation(model_generated_atom_array, default="generate").copy()
@@ -688,17 +693,26 @@ def annotate_unindexed_insertion(
     # superposition
     model_generated_atom_array = _restage_internal_coord_cwi_per_group(model_generated_atom_array, reference_coord)
 
-    if has_3d_conditioning.any():
-        expected_unindexed_count = int(has_3d_conditioning.sum())
-        actual_unindexed_count = int(mapped_to_coordinate_conditioned_region.sum())
-        if actual_unindexed_count != expected_unindexed_count:
-            global_logger.warning(
-                f"Model reproduced only {actual_unindexed_count} of {expected_unindexed_count} "
-                "coord-conditioned motif atoms; invalidating the unindexed motif reference coords."
-            )
-            # Invalidate only the unindexed motif coords; leave any directly-indexed groups intact.
+    # A motif token whose coord-conditioned atoms did not land one-for-one on distinct target atoms
+    # was not faithfully reproduced, so its reference coords must not be scored. Checked PER TOKEN:
+    # a token that mapped completely keeps valid reference coords even when a sibling region failed.
+    # A global check would invalidate a good region because of a bad one, and because unindexed and
+    # indexed motif atoms may share one coordinate group (every absolute motif sits in group 0), the
+    # resulting NaN would poison that group's RMSD and discard the indexed motif's score as well.
+    if per_token_coord_staging:
+        invalid_targets: list[np.ndarray] = []
+        for unindexed_token_id, (expected_count, staged_targets) in per_token_coord_staging.items():
+            actual_count = int(np.unique(staged_targets).size)
+            if actual_count != expected_count:
+                global_logger.warning(
+                    f"Unindexed token {unindexed_token_id}: only {actual_count} of {expected_count} "
+                    "coord-conditioned motif atoms landed on distinct target atoms; invalidating this "
+                    "region's reference coords."
+                )
+                invalid_targets.append(staged_targets)
+        if invalid_targets:
             cwi = SA_CWI.annotation(model_generated_atom_array)
-            cwi[mapped_to_coordinate_conditioned_region] = np.nan
+            cwi[np.concatenate(invalid_targets)] = np.nan
             SA_CWI.set_annotation(model_generated_atom_array, np.asarray(cwi, dtype=np.float32))
 
     if not mapped_to_unindexed_insertion.any():
