@@ -45,6 +45,22 @@ motif_rmsd_filter:
     motif_rmsd.rmsd:
       max: 1.0
 
+# Geometry gate for unindexed motifs. unindexed_insertion_mapping_filter only checks that the
+# insertion mapping was APPLIED, so a design whose motif was placed far from its conditioned
+# coordinates still passes it. This thresholds the insertion geometry itself, using the metric
+# provided by inline_metrics/design_metrics.yaml.
+# NOTE: prefer this over insertion_rmsd_filter / motif_rmsd_filter above, whose metrics
+# (unindexed_metrics.insertion_rmsd, motif_rmsd.rmsd) have no provider in configs/ -- enabling
+# those tags makes every design fail on the missing key.
+unindexed_motif_rmsd_filter:
+  _target_: rfproteina.metrics.oracles.pass_criterion_metric.PassCriterionMetric
+  required_tags_all:
+    - unindexed
+    - unindexed_motif_rmsd_filter
+  metric_thresholds:
+    design_unindexed_motif_allatom_rmsd.rmsd:
+      max: 1.0
+
 ligand_clash_filter:
   _target_: rfproteina.metrics.oracles.pass_criterion_metric.PassCriterionMetric
   metric_thresholds:

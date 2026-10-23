@@ -557,8 +557,33 @@ def annotate_unindexed_insertion(
     is_coord_conditioned_in_context = np.zeros(atom_array.array_length(), dtype=bool)
     is_coord_conditioned_in_context[~has_index] = has_3d_conditioning
 
+    # Resolve every token's atom correspondence BEFORE mutating anything. This is the step that
+    # fails when a target residue cannot host the motif's atoms (unmatched names, then an
+    # infeasible element fallback). Resolving up front lets one unusable region be dropped on its
+    # own, instead of aborting the whole transfer and discarding every other region with it.
+    applicable_mapping: dict[int, tuple[int, np.ndarray]] = {}
+    for unindexed_token_id, target_token_id in token_mapping.items():
+        candidate_src_mask = ~has_index & (atom_array.token_id == unindexed_token_id)
+        candidate_target_mask = (atom_array.token_id == target_token_id) & has_index
+        try:
+            correspondence = _get_target_indices_corresponding_to_inserted(
+                atom_array, candidate_src_mask, candidate_target_mask, allow_element_fallback=True
+            )
+        except ValueError as e:
+            global_logger.warning(
+                f"Dropping unindexed token {unindexed_token_id}: its atoms cannot be matched onto "
+                f"target token {target_token_id} ({e}). Other unindexed regions are unaffected."
+            )
+            continue
+        applicable_mapping[unindexed_token_id] = (target_token_id, correspondence)
+
+    # Every region was unusable -- same outcome as a wholly unappliable mapping.
+    if not applicable_mapping:
+        global_logger.warning("No unindexed region could be mapped; the unindexed conditioning is dropped.")
+        return _set_empty_unindexed_annotations()
+
     try:
-        for unindexed_token_id, target_token_id in token_mapping.items():
+        for unindexed_token_id, (target_token_id, token_correspondence) in applicable_mapping.items():
             unindexed_token_mask = in_context_conditioning.token_id == unindexed_token_id
             unindexed_token = in_context_conditioning[unindexed_token_mask]
             token_src_id = (
@@ -573,14 +598,9 @@ def annotate_unindexed_insertion(
             # Values come from the source's stored ANNOTATION (the frozen original input), not the live
             # coord / res_name. Source and target atoms line up (same residue, same atoms), so one name
             # correspondence carries every condition -- atom- and residue-level alike.
-            target_mask_indexed = (atom_array.token_id == target_token_id) & has_index
             src_token_mask = ~has_index & (atom_array.token_id == unindexed_token_id)
             src_token_indices = np.where(src_token_mask)[0]
-            token_target_indices = generated_indices[target_mask_generated][
-                _get_target_indices_corresponding_to_inserted(
-                    atom_array, src_token_mask, target_mask_indexed, allow_element_fallback=True
-                )
-            ]
+            token_target_indices = generated_indices[target_mask_generated][token_correspondence]
             for cond in conditions_to_copy:
                 carries = cond.mask(atom_array, default="generate")[src_token_indices]
                 if not carries.any():
