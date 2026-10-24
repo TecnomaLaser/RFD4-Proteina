@@ -32,6 +32,14 @@ interchain_interactions:
   required_tags_any: ["interchain_interactions"]
   prohibited_tags: ["small_molecule_only", "structure_prediction"]
 
+# interchain_interactions scores H-bond conditioning adherence with inter_chain_only=True, so an
+# H-bond requested between a conditioned atom and a residue designed in the SAME chain is
+# invisible to it. This measures that case: distance to the nearest polar atom the model was
+# free to place. NaN when nothing is H-bond-conditioned.
+hbond_conditioning_proximity:
+  _target_: rfproteina.metrics.hbond_proximity_metric.HBondConditioningProximityMetric
+  required_tags_any: ["hbond_conditioning", "design"]
+
 # Reports NaN when nothing was sequence-conditioned
 sequence_adherence:
   _target_: rfproteina.metrics.sequence_adherence_metric.SequenceAdherenceMetric
@@ -83,6 +91,27 @@ design_unindexed_motif_allatom_rmsd:
   align_mask: "sa_mask('SA_CRDSRC') & is_unindexed_insertion"
   subset_mask: "sa_mask('SA_CRDSRC') & is_unindexed_insertion"
   subdivide_by_annotation: condition_CoordinateGroup_1_atom
+  gt_coord_annotation_name: annotation_coords-with-insertion_1_atom
+  metric_type: rmsd
+  aggregation: [median]
+  input_kwarg_names:
+    ground_truth_atom_array: predicted_atom_array
+    predicted_atom_array: predicted_atom_array
+  required_tags_all: ["unindexed"]
+
+# Unlike design_unindexed_motif_allatom_rmsd above, this aligns on the coordinate-conditioned
+# atoms the model was NOT free to place (the indexed motif and any fixed ligand) and scores the
+# unindexed insertions in that frame. That difference matters: the metric above uses the inserted
+# atoms as both its alignment and its scoring set, so it superposes the insertion onto its own
+# reference and reports only the insertion's INTERNAL geometry -- a motif placed far from its
+# conditioned location still scores near zero. Use this one to ask whether an unindexed motif
+# landed in the right place, and that one to ask whether its internal geometry is right.
+# No subdivide_by_annotation: subdivision makes independent align+score groups, so a per-island
+# slice would contain no non-insertion atoms for the align mask to select.
+design_unindexed_motif_placement_rmsd:
+  _target_: rfproteina.metrics.gt_structure_comparison.StructureComparisonMetric
+  align_mask: "sa_mask('SA_CRDSRC') & ~is_unindexed_insertion"
+  subset_mask: "sa_mask('SA_CRDSRC') & is_unindexed_insertion"
   gt_coord_annotation_name: annotation_coords-with-insertion_1_atom
   metric_type: rmsd
   aggregation: [median]
