@@ -557,8 +557,37 @@ def annotate_unindexed_insertion(
     is_coord_conditioned_in_context = np.zeros(atom_array.array_length(), dtype=bool)
     is_coord_conditioned_in_context[~has_index] = has_3d_conditioning
 
+    # Resolve every token's atom correspondence BEFORE mutating anything. This is the step that
+    # fails when a target residue cannot host the motif's atoms (unmatched names, then an
+    # infeasible element fallback). Resolving up front lets one unusable region be dropped on its
+    # own, instead of aborting the whole transfer and discarding every other region with it.
+    applicable_mapping: dict[int, tuple[int, np.ndarray]] = {}
+    for unindexed_token_id, target_token_id in token_mapping.items():
+        candidate_src_mask = ~has_index & (atom_array.token_id == unindexed_token_id)
+        candidate_target_mask = (atom_array.token_id == target_token_id) & has_index
+        try:
+            correspondence = _get_target_indices_corresponding_to_inserted(
+                atom_array, candidate_src_mask, candidate_target_mask, allow_element_fallback=True
+            )
+        except ValueError as e:
+            global_logger.warning(
+                f"Dropping unindexed token {unindexed_token_id}: its atoms cannot be matched onto "
+                f"target token {target_token_id} ({e}). Other unindexed regions are unaffected."
+            )
+            continue
+        applicable_mapping[unindexed_token_id] = (target_token_id, correspondence)
+
+    # Every region was unusable -- same outcome as a wholly unappliable mapping.
+    if not applicable_mapping:
+        global_logger.warning("No unindexed region could be mapped; the unindexed conditioning is dropped.")
+        return _set_empty_unindexed_annotations()
+
+    # Per-token coord staging, so an incompletely reproduced motif invalidates only its own
+    # reference coords: {unindexed_token_id: (expected_atom_count, staged_target_indices)}.
+    per_token_coord_staging: dict[int, tuple[int, np.ndarray]] = {}
+
     try:
-        for unindexed_token_id, target_token_id in token_mapping.items():
+        for unindexed_token_id, (target_token_id, token_correspondence) in applicable_mapping.items():
             unindexed_token_mask = in_context_conditioning.token_id == unindexed_token_id
             unindexed_token = in_context_conditioning[unindexed_token_mask]
             token_src_id = (
@@ -573,14 +602,9 @@ def annotate_unindexed_insertion(
             # Values come from the source's stored ANNOTATION (the frozen original input), not the live
             # coord / res_name. Source and target atoms line up (same residue, same atoms), so one name
             # correspondence carries every condition -- atom- and residue-level alike.
-            target_mask_indexed = (atom_array.token_id == target_token_id) & has_index
             src_token_mask = ~has_index & (atom_array.token_id == unindexed_token_id)
             src_token_indices = np.where(src_token_mask)[0]
-            token_target_indices = generated_indices[target_mask_generated][
-                _get_target_indices_corresponding_to_inserted(
-                    atom_array, src_token_mask, target_mask_indexed, allow_element_fallback=True
-                )
-            ]
+            token_target_indices = generated_indices[target_mask_generated][token_correspondence]
             for cond in conditions_to_copy:
                 carries = cond.mask(atom_array, default="generate")[src_token_indices]
                 if not carries.any():
@@ -618,6 +642,7 @@ def annotate_unindexed_insertion(
             )
             remapped_coord[coord_target] = token_ref_coord[token_coord_mask]
             reference_coord[coord_target] = unindexed_internal_coords[unindexed_token_mask][token_coord_mask]
+            per_token_coord_staging[unindexed_token_id] = (int(token_coord_mask.sum()), coord_target)
 
         # Insertion restores membership and frozen targets together, in the source groups' frames.
         internal_targets = C_INTCRD.annotation(model_generated_atom_array, default="generate").copy()
@@ -668,17 +693,26 @@ def annotate_unindexed_insertion(
     # superposition
     model_generated_atom_array = _restage_internal_coord_cwi_per_group(model_generated_atom_array, reference_coord)
 
-    if has_3d_conditioning.any():
-        expected_unindexed_count = int(has_3d_conditioning.sum())
-        actual_unindexed_count = int(mapped_to_coordinate_conditioned_region.sum())
-        if actual_unindexed_count != expected_unindexed_count:
-            global_logger.warning(
-                f"Model reproduced only {actual_unindexed_count} of {expected_unindexed_count} "
-                "coord-conditioned motif atoms; invalidating the unindexed motif reference coords."
-            )
-            # Invalidate only the unindexed motif coords; leave any directly-indexed groups intact.
+    # A motif token whose coord-conditioned atoms did not land one-for-one on distinct target atoms
+    # was not faithfully reproduced, so its reference coords must not be scored. Checked PER TOKEN:
+    # a token that mapped completely keeps valid reference coords even when a sibling region failed.
+    # A global check would invalidate a good region because of a bad one, and because unindexed and
+    # indexed motif atoms may share one coordinate group (every absolute motif sits in group 0), the
+    # resulting NaN would poison that group's RMSD and discard the indexed motif's score as well.
+    if per_token_coord_staging:
+        invalid_targets: list[np.ndarray] = []
+        for unindexed_token_id, (expected_count, staged_targets) in per_token_coord_staging.items():
+            actual_count = int(np.unique(staged_targets).size)
+            if actual_count != expected_count:
+                global_logger.warning(
+                    f"Unindexed token {unindexed_token_id}: only {actual_count} of {expected_count} "
+                    "coord-conditioned motif atoms landed on distinct target atoms; invalidating this "
+                    "region's reference coords."
+                )
+                invalid_targets.append(staged_targets)
+        if invalid_targets:
             cwi = SA_CWI.annotation(model_generated_atom_array)
-            cwi[mapped_to_coordinate_conditioned_region] = np.nan
+            cwi[np.concatenate(invalid_targets)] = np.nan
             SA_CWI.set_annotation(model_generated_atom_array, np.asarray(cwi, dtype=np.float32))
 
     if not mapped_to_unindexed_insertion.any():

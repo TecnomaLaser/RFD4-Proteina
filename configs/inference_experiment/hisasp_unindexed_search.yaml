@@ -1,0 +1,67 @@
+# @package _global_
+# Beam search for the unindexed His/Asp theozyme. No refolding oracle: both checkpoints
+# score design metrics only, so cost is branching alone.
+#   rfd4-generate inference_experiment=hisasp_unindexed_search recycle_strategy=medium/midpeak
+# recycle_strategy is a CLI group selection (not in the defaults list), so it is passed
+# explicitly; medium/midpeak is the MCSA/small-molecule schedule and gives nsteps=60.
+#
+# The geometry term is design_unindexed_motif_placement_rmsd, NOT
+# design_unindexed_motif_allatom_rmsd: the latter aligns the inserted atoms onto their own
+# reference, so it scores only internal geometry and a motif placed 12 A away still scores ~0.
+# Rewarding it optimised the wrong quantity. The placement metric aligns on the conditioned
+# atoms the model could not move, so it actually measures where the motif landed.
+#
+# Reward is deliberately lexicographic -- mapping completeness first, then geometry.
+# Scoring geometry alone would be actively harmful: when only one island maps, the pooled
+# RMSD is computed over that island alone, so partial mappings score BETTER than full ones
+# (observed: a 0.01 A median on rows with n_unmapped_tokens=1). The -3.0 weight on
+# n_unmapped_tokens makes any partial mapping (<= -1.5) strictly worse than the worst
+# fully-mapped design (>= -1.0), so the search cannot win by dropping an island.
+#
+# NaN RMSD (no mapping at all) is masked to -inf by the beam prune, so those candidates
+# are discarded without any term needing to cover them.
+
+defaults:
+  - inference_on_user_inputs
+  - _self_
+
+inputs: ${oc.env:PROJECT_ROOT}/working.cif
+num_replicates: 20
+seed: 1001
+
+out_dir: ./runs/hisasp_search
+run_name_: hisasp_unindexed_search
+
+# No unindexed_motif_rmsd_filter: a design failing a pre-oracle filter keeps its metrics
+# row but loses its structure, and per-island geometry has to be inspected on disk.
+metrics_tags: [unindexed, 3d_coordinate_conditioning, design]
+
+search:
+  n_branch: 2
+  beam_width: 2
+  checkpoints:
+    # Mid-trajectory prune on the clean prediction: design metrics only, no rollout.
+    "40":
+      metrics: [design_unindexed_motif_placement_rmsd, unindexed_insertion_mapping]
+      use_clean_prediction: true
+      rewards:
+        unindexed_insertion_mapping.n_unmapped_tokens:
+          weight: -3.0
+          clip: {max: 2.0}
+          normalize_by: 2.0
+        design_unindexed_motif_placement_rmsd.rmsd:
+          weight: -1.0
+          clip: {max: 5.0}
+          normalize_by: 5.0
+    # Schedule end: scores completed structures and selects the returned beam.
+    "60":
+      metrics: [design_unindexed_motif_placement_rmsd, unindexed_insertion_mapping]
+      rewards:
+        unindexed_insertion_mapping.n_unmapped_tokens:
+          weight: -3.0
+          clip: {max: 2.0}
+          normalize_by: 2.0
+        design_unindexed_motif_placement_rmsd.rmsd:
+          weight: -1.0
+          clip: {max: 5.0}
+          normalize_by: 5.0
